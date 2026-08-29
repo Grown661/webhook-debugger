@@ -11,8 +11,13 @@ const fs = require('node:fs/promises');
 const fssync = require('node:fs');
 const path = require('node:path');
 const { URL } = require('node:url');
+const dns = require('node:dns/promises');
+const net = require('node:net');
 
 const PORT = Number(process.env.PORT) || 8216;
+// Opt-in-SSRF-Schutz fuer Forwards: Forward an localhost/LAN ist bei einem
+// Debug-Tool oft gewollt, darum default AUS. Aktivieren mit SSRF_PROTECT=1.
+const SSRF_PROTECT = process.env.SSRF_PROTECT === '1';
 const MAX_REQUESTS_PER_BIN = 50; // Ringpuffer
 const MAX_BODY_BYTES = 256 * 1024; // 256 KB pro Request-Body
 const DATA_DIR = path.join(__dirname, 'data');
@@ -79,8 +84,61 @@ function readBody(req, maxBytes = MAX_BODY_BYTES) {
   });
 }
 
-function forwardRequest(binReq, forwardUrl) {
+// ---------- SSRF-Schutz (dependency-frei) ----------
+
+function isPrivateOrReservedIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 127) return true;                    // 127.0.0.0/8
+    if (a === 10) return true;                     // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;       // 192.168.0.0/16
+    if (a === 169 && b === 254) return true;       // 169.254.0.0/16
+    if (a === 0) return true;                      // 0.0.0.0/8
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); // IPv4-mapped
+    if (mapped) return isPrivateOrReservedIp(mapped[1]);
+    if (lower === '::1' || lower === '::') return true;
+    if (/^f[cd]/.test(lower)) return true;         // fc00::/7 (ULA)
+    if (/^fe[89ab]/.test(lower)) return true;      // fe80::/10 (link-local)
+    return false;
+  }
+  return true; // unbekanntes Format -> sicherheitshalber blocken
+}
+
+// Wirft, wenn die URL nicht auf eine oeffentliche IP zeigt.
+async function assertPublicUrl(urlString) {
+  let u;
+  try { u = new URL(urlString); } catch { throw new Error('ungueltige URL'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error('nur http/https erlaubt');
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (host.toLowerCase() === 'localhost') throw new Error('localhost ist geblockt');
+  let addrs;
+  if (net.isIP(host)) {
+    addrs = [{ address: host }];
+  } else {
+    try { addrs = await dns.lookup(host, { all: true }); }
+    catch { throw new Error(`DNS-Aufloesung fehlgeschlagen: ${host}`); }
+  }
+  for (const { address } of addrs) {
+    if (isPrivateOrReservedIp(address)) {
+      throw new Error(`private/reservierte Ziel-IP geblockt: ${host} -> ${address}`);
+    }
+  }
+  return u;
+}
+
+async function forwardRequest(binReq, forwardUrl) {
   // Fire-and-forget-Weiterleitung; Ergebnis wird am gespeicherten Request notiert.
+  if (SSRF_PROTECT) {
+    try { await assertPublicUrl(forwardUrl); }
+    catch (e) { return { ok: false, error: `SSRF-Schutz: ${e.message}` }; }
+  }
   return new Promise((resolve) => {
     let target;
     try {

@@ -48,6 +48,26 @@ curl -X POST http://localhost:8216/hook/<binId> \
 
 Anderer Port: `PORT=8300 node server.js`
 
+## SSRF-Schutz fuer Forwards (opt-in)
+
+Standardmaessig darf `forwardUrl` auf beliebige Ziele zeigen — inklusive
+`localhost` und LAN-IPs, weil das bei einem lokalen Debug-Tool oft genau
+gewollt ist (z. B. Forward an den eigenen Dev-Server).
+
+Wird der Debugger aber erreichbar betrieben (LAN/Internet), sollte der
+Schutz aktiviert werden:
+
+```bash
+SSRF_PROTECT=1 node server.js
+```
+
+Damit prueft `assertPublicUrl()` jede Forward-URL vor dem Request:
+nur `http/https`, Hostname wird per DNS aufgeloest, und private/reservierte
+Ziele (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+169.254.0.0/16, 0.0.0.0/8, `::1`, fc00::/7, fe80::/10, `localhost`) werden
+geblockt. Geblockte Forwards erscheinen am gespeicherten Request als
+`forward.error` ("SSRF-Schutz: ..."); das Capture selbst ist nie betroffen.
+
 ## API
 
 | Methode | Pfad | Beschreibung |
