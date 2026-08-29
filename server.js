@@ -44,7 +44,7 @@ async function loadStore() {
 function persist() {
   writeQueue = writeQueue.then(() =>
     fs.writeFile(DATA_FILE, JSON.stringify(bins, null, 2), 'utf8')
-  );
+  ).catch((e) => console.error('persist:', e.message));
   return writeQueue;
 }
 
