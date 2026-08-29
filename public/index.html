@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webhook-debugger</title>
+<style>
+  :root { color-scheme: light dark; --accent: #0969da; --border: #8884; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; max-width: 920px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { margin-bottom: .2rem; }
+  .sub { color: gray; margin-top: 0; }
+  button { padding: .45rem .9rem; border: 1px solid var(--border); border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; font-size: 1rem; }
+  button.secondary { background: transparent; color: inherit; }
+  input[type=url] { padding: .45rem; border: 1px solid var(--border); border-radius: 6px; width: 100%; max-width: 420px; font-size: .95rem; background: transparent; color: inherit; }
+  code, pre { font-family: ui-monospace, monospace; }
+  code { background: #8882; padding: .1rem .35rem; border-radius: 4px; }
+  .hookurl { font-size: 1.05rem; word-break: break-all; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  details { border: 1px solid var(--border); border-radius: 8px; padding: .6rem .9rem; margin: .5rem 0; }
+  summary { cursor: pointer; display: flex; gap: .8rem; align-items: baseline; flex-wrap: wrap; }
+  summary::-webkit-details-marker { display: none; }
+  .method { font-weight: 700; font-family: ui-monospace, monospace; padding: .1rem .45rem; border-radius: 4px; background: #8882; }
+  .m-POST { color: #0550ae; } .m-GET { color: #1a7f37; } .m-PUT { color: #9a6700; } .m-DELETE { color: #cf222e; } .m-PATCH { color: #8250df; }
+  .time { color: gray; font-size: .85rem; }
+  pre { background: #8881; border: 1px solid var(--border); border-radius: 6px; padding: .7rem; overflow-x: auto; font-size: .85rem; max-height: 300px; }
+  .empty { color: gray; font-style: italic; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .6rem 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #2da44e; animation: pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .fwd-ok { color: #1a7f37; } .fwd-fail { color: #cf222e; }
+</style>
+</head>
+<body>
+<h1>webhook-debugger</h1>
+<p class="sub">Webhooks empfangen, ansehen, debuggen — wie requestbin, selbst gehostet.</p>
+
+<div id="setup" class="card">
+  <p>Erstelle ein <strong>Bin</strong> und schicke beliebige Requests an seine Hook-URL.</p>
+  <div class="row">
+    <button id="createBtn">Neues Bin erstellen</button>
+    <input type="url" id="forwardUrl" placeholder="optional: forward-URL (http://...)">
+  </div>
+</div>
+
+<div id="binView" style="display:none">
+  <div class="card">
+    <div class="row">
+      <span class="dot"></span>
+      <strong>Hook-URL:</strong>
+      <code class="hookurl" id="hookUrl"></code>
+      <button class="secondary" id="copyBtn">Kopieren</button>
+      <button class="secondary" id="newBinBtn">Anderes Bin</button>
+    </div>
+    <div class="row time" id="binMeta"></div>
+    <div class="row">
+      Test: <code id="curlExample"></code>
+    </div>
+  </div>
+  <h2>Eingehende Requests <span class="time" id="count"></span></h2>
+  <div id="requests"><p class="empty">Noch keine Requests empfangen — die Liste aktualisiert sich alle 2 Sekunden.</p></div>
+</div>
+
+<script>
+'use strict';
+
+let binId = null;
+let pollTimer = null;
+let knownIds = new Set();
+
+const $ = (id) => document.getElementById(id);
+
+function hookAbsUrl() {
+  return location.origin + '/hook/' + binId;
+}
+
+async function createBin() {
+  const forwardUrl = $('forwardUrl').value.trim() || undefined;
+  const res = await fetch('/api/bins', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(forwardUrl ? { forwardUrl } : {}),
+  });
+  const bin = await res.json();
+  openBin(bin.id, bin.forwardUrl);
+}
+
+function openBin(id, forwardUrl) {
+  binId = id;
+  knownIds = new Set();
+  history.replaceState(null, '', '#' + id);
+  $('setup').style.display = 'none';
+  $('binView').style.display = '';
+  $('hookUrl').textContent = hookAbsUrl();
+  $('binMeta').textContent = forwardUrl ? ('Weiterleitung an: ' + forwardUrl) : 'Keine Weiterleitung konfiguriert.';
+  $('curlExample').textContent = 'curl -X POST ' + hookAbsUrl() + ' -H "Content-Type: application/json" -d \'{"hello":"world"}\'';
+  $('requests').innerHTML = '<p class="empty">Noch keine Requests empfangen — die Liste aktualisiert sich alle 2 Sekunden.</p>';
+  if (pollTimer) clearInterval(pollTimer);
+  poll();
+  pollTimer = setInterval(poll, 2000);
+}
+
+async function poll() {
+  if (!binId) return;
+  let data;
+  try {
+    const res = await fetch('/api/bins/' + binId + '/requests');
+    if (!res.ok) return;
+    data = await res.json();
+  } catch { return; }
+
+  $('count').textContent = '(' + data.count + (data.count >= 50 ? ', Ringpuffer voll' : '') + ')';
+  if (!data.requests.length) return;
+
+  const container = $('requests');
+  if (container.querySelector('.empty')) container.innerHTML = '';
+
+  // Neueste zuerst; nur neue Eintraege oben einfuegen.
+  for (let i = data.requests.length - 1; i >= 0; i--) {
+    const r = data.requests[i];
+    if (knownIds.has(r.id)) continue;
+    knownIds.add(r.id);
+    container.prepend(renderRequest(r));
+  }
+}
+
+function renderRequest(r) {
+  const d = document.createElement('details');
+  const time = new Date(r.receivedAt).toLocaleTimeString();
+  let fwdBadge = '';
+  if (r.forward) {
+    fwdBadge = r.forward.ok
+      ? '<span class="fwd-ok">→ weitergeleitet (' + r.forward.status + ')</span>'
+      : '<span class="fwd-fail">→ Weiterleitung fehlgeschlagen</span>';
+  }
+  d.innerHTML =
+    '<summary>' +
+      '<span class="method m-' + escapeHtml(r.method) + '">' + escapeHtml(r.method) + '</span>' +
+      '<span class="time">' + time + '</span>' +
+      '<span class="time">' + escapeHtml(r.ip) + '</span>' +
+      fwdBadge +
+    '</summary>' +
+    section('Headers', JSON.stringify(r.headers, null, 2)) +
+    (Object.keys(r.query).length ? section('Query', JSON.stringify(r.query, null, 2)) : '') +
+    section('Body' + (r.bodyTruncated ? ' (gekuerzt)' : ''), r.body || '(leer)');
+  return d;
+}
+
+function section(title, content) {
+  return '<h4 style="margin:.6rem 0 .2rem">' + title + '</h4><pre>' + escapeHtml(content) + '</pre>';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+$('createBtn').addEventListener('click', createBin);
+$('newBinBtn').addEventListener('click', () => {
+  if (pollTimer) clearInterval(pollTimer);
+  binId = null;
+  history.replaceState(null, '', location.pathname);
+  $('binView').style.display = 'none';
+  $('setup').style.display = '';
+});
+$('copyBtn').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(hookAbsUrl()); $('copyBtn').textContent = 'Kopiert!'; }
+  catch { /* clipboard evtl. nicht verfuegbar */ }
+  setTimeout(() => { $('copyBtn').textContent = 'Kopieren'; }, 1500);
+});
+
+// Bin aus URL-Hash wiederherstellen (#binId)
+if (location.hash.length > 1) {
+  const id = location.hash.slice(1);
+  fetch('/api/bins/' + id).then((r) => {
+    if (r.ok) return r.json().then((b) => openBin(b.id, b.forwardUrl));
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>
