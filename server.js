@@ -186,7 +186,8 @@ const server = http.createServer(async (req, res) => {
     const hookMatch = pathname.match(/^\/hook\/([a-zA-Z0-9]+)$/);
     if (hookMatch) {
       const binId = hookMatch[1];
-      const bin = bins[binId];
+      // Nur echte eigene Keys — sonst liefert bins['constructor'] die Prototype-Funktion
+      const bin = Object.hasOwn(bins, binId) ? bins[binId] : null;
       if (!bin) {
         sendJson(res, 404, { error: 'bin not found', hint: 'Bin zuerst im UI erstellen' });
         return;
@@ -227,13 +228,21 @@ const server = http.createServer(async (req, res) => {
       let forwardUrl = null;
       const { body } = await readBody(req);
       if (body) {
+        // Body ist optional; wenn vorhanden, muss er ein JSON-Objekt sein
+        // (JSON.parse('null') liefert null ohne Fehler -> sonst 500 statt 400)
+        let parsed;
         try {
-          const parsed = JSON.parse(body);
-          if (parsed.forwardUrl && typeof parsed.forwardUrl === 'string') {
-            forwardUrl = parsed.forwardUrl;
-          }
+          parsed = JSON.parse(body);
         } catch {
-          /* leerer/kein JSON-Body ist ok */
+          sendJson(res, 400, { error: 'invalid body' });
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          sendJson(res, 400, { error: 'invalid body' });
+          return;
+        }
+        if (parsed.forwardUrl && typeof parsed.forwardUrl === 'string') {
+          forwardUrl = parsed.forwardUrl;
         }
       }
       const id = newBinId();
@@ -245,7 +254,8 @@ const server = http.createServer(async (req, res) => {
 
     const binApiMatch = pathname.match(/^\/api\/bins\/([a-zA-Z0-9]+)(\/requests)?$/);
     if (binApiMatch) {
-      const bin = bins[binApiMatch[1]];
+      // Nur echte eigene Keys — sonst liefert bins['constructor'] die Prototype-Funktion
+      const bin = Object.hasOwn(bins, binApiMatch[1]) ? bins[binApiMatch[1]] : null;
       if (!bin) return sendJson(res, 404, { error: 'bin not found' });
 
       if (req.method === 'GET' && binApiMatch[2]) {
@@ -267,13 +277,19 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'PUT') {
         const { body } = await readBody(req);
+        let parsed;
         try {
-          const parsed = JSON.parse(body || '{}');
-          bin.forwardUrl = typeof parsed.forwardUrl === 'string' && parsed.forwardUrl ? parsed.forwardUrl : null;
+          parsed = JSON.parse(body || '{}');
         } catch {
           sendJson(res, 400, { error: 'invalid JSON body' });
           return;
         }
+        // JSON.parse('null') liefert null ohne Fehler -> ohne Check gaebe es 500 statt 400
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          sendJson(res, 400, { error: 'invalid body' });
+          return;
+        }
+        bin.forwardUrl = typeof parsed.forwardUrl === 'string' && parsed.forwardUrl ? parsed.forwardUrl : null;
         await persist();
         sendJson(res, 200, { id: bin.id, forwardUrl: bin.forwardUrl });
         return;
