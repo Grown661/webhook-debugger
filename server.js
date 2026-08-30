@@ -84,32 +84,33 @@ function readBody(req, maxBytes = MAX_BODY_BYTES) {
   });
 }
 
-// ---------- SSRF-Schutz (dependency-frei) ----------
+// ---------- SSRF-Schutz (dependency-frei, net.BlockList) ----------
+
+// net.BlockList statt manueller Range-Pruefung: BlockList normalisiert auch
+// IPv4-mapped IPv6 in HEX-Form (::ffff:7f00:1) und matcht sie gegen die
+// IPv4-Subnets — die manuelle Pruefung erkannte nur die Punktform.
+const PRIVATE_BLOCKLIST = new net.BlockList();
+PRIVATE_BLOCKLIST.addSubnet('0.0.0.0', 8, 'ipv4');      // "this network"
+PRIVATE_BLOCKLIST.addSubnet('10.0.0.0', 8, 'ipv4');     // privat
+PRIVATE_BLOCKLIST.addSubnet('127.0.0.0', 8, 'ipv4');    // loopback
+PRIVATE_BLOCKLIST.addSubnet('169.254.0.0', 16, 'ipv4'); // link-local
+PRIVATE_BLOCKLIST.addSubnet('172.16.0.0', 12, 'ipv4');  // privat
+PRIVATE_BLOCKLIST.addSubnet('192.168.0.0', 16, 'ipv4'); // privat
+PRIVATE_BLOCKLIST.addAddress('::', 'ipv6');             // unspecified
+PRIVATE_BLOCKLIST.addSubnet('::1', 128, 'ipv6');        // loopback
+PRIVATE_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6');       // ULA
+PRIVATE_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6');      // link-local
 
 function isPrivateOrReservedIp(ip) {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
-    if (a === 127) return true;                    // 127.0.0.0/8
-    if (a === 10) return true;                     // 10.0.0.0/8
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true;       // 192.168.0.0/16
-    if (a === 169 && b === 254) return true;       // 169.254.0.0/16
-    if (a === 0) return true;                      // 0.0.0.0/8
-    return false;
-  }
-  if (net.isIPv6(ip)) {
-    const lower = ip.toLowerCase();
-    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); // IPv4-mapped
-    if (mapped) return isPrivateOrReservedIp(mapped[1]);
-    if (lower === '::1' || lower === '::') return true;
-    if (/^f[cd]/.test(lower)) return true;         // fc00::/7 (ULA)
-    if (/^fe[89ab]/.test(lower)) return true;      // fe80::/10 (link-local)
-    return false;
-  }
-  return true; // unbekanntes Format -> sicherheitshalber blocken
+  const family = net.isIP(ip);
+  if (family === 0) return true; // unbekanntes Format -> sicherheitshalber blocken
+  return PRIVATE_BLOCKLIST.check(ip, family === 6 ? 'ipv6' : 'ipv4');
 }
 
 // Wirft, wenn die URL nicht auf eine oeffentliche IP zeigt.
+// Gibt die geprueften Daten zurueck, inkl. einer lookup-Funktion, die genau die
+// geprueften IP PINNT — der eigentliche Request darf kein zweites DNS-Lookup
+// machen (DNS-Rebinding/TOCTOU: kurze TTL koennte beim 2. Lookup privat aufloesen).
 async function assertPublicUrl(urlString) {
   let u;
   try { u = new URL(urlString); } catch { throw new Error('ungueltige URL'); }
@@ -120,23 +121,34 @@ async function assertPublicUrl(urlString) {
   if (host.toLowerCase() === 'localhost') throw new Error('localhost ist geblockt');
   let addrs;
   if (net.isIP(host)) {
-    addrs = [{ address: host }];
+    addrs = [{ address: host, family: net.isIP(host) }];
   } else {
     try { addrs = await dns.lookup(host, { all: true }); }
     catch { throw new Error(`DNS-Aufloesung fehlgeschlagen: ${host}`); }
   }
+  if (!addrs.length) throw new Error(`DNS-Aufloesung leer: ${host}`);
   for (const { address } of addrs) {
     if (isPrivateOrReservedIp(address)) {
       throw new Error(`private/reservierte Ziel-IP geblockt: ${host} -> ${address}`);
     }
   }
-  return u;
+  const pinned = addrs[0];
+  const family = pinned.family || net.isIP(pinned.address);
+  const lookup = (hostname, options, cb) => {
+    if (typeof options === 'function') { cb = options; options = {}; }
+    if (options && options.all) cb(null, [{ address: pinned.address, family }]);
+    else cb(null, pinned.address, family);
+  };
+  return { url: u, address: pinned.address, family, lookup };
 }
 
 async function forwardRequest(binReq, forwardUrl) {
   // Fire-and-forget-Weiterleitung; Ergebnis wird am gespeicherten Request notiert.
+  let pinnedLookup = null;
   if (SSRF_PROTECT) {
-    try { await assertPublicUrl(forwardUrl); }
+    // Geprüfte IP pinnen: der Request unten macht kein zweites DNS-Lookup
+    // (DNS-Rebinding/TOCTOU). Ohne SSRF_PROTECT bleibt alles beim Default.
+    try { pinnedLookup = (await assertPublicUrl(forwardUrl)).lookup; }
     catch (e) { return { ok: false, error: `SSRF-Schutz: ${e.message}` }; }
   }
   return new Promise((resolve) => {
@@ -157,7 +169,7 @@ async function forwardRequest(binReq, forwardUrl) {
     delete headers['content-length'];
     const fwd = mod.request(
       target,
-      { method: binReq.method, headers, timeout: 5000 },
+      { method: binReq.method, headers, timeout: 5000, ...(pinnedLookup ? { lookup: pinnedLookup } : {}) },
       (fres) => {
         fres.resume();
         resolve({ ok: true, status: fres.statusCode });
